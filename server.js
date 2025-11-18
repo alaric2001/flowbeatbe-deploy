@@ -2,57 +2,62 @@ const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
 const path = require('path');
-
-// Konfigurasi koneksi ke MySQL dengan env
 const dotenv = require('dotenv');
 dotenv.config();
 
 const bodyParser = require('body-parser');
 const app = express();
-app.use(cors());
+
+// ✅ CORS config untuk production
+app.use(cors({
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+    credentials: true
+}));
+
 app.use(bodyParser.json());
 
-const bcrypt = require('bcryptjs'); //untuk autentikasi
-const jwt = require('jsonwebtoken'); //untuk autentikasi
-
-const multer = require('multer'); //untuk update akun
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
 const fs = require('fs');
 
-//port dengan env (tidak hardcode)
-const HOST = process.env.HOST;
-const PORT = process.env.PORT;
-const IP_PUBLIC = process.env.IP_PUBLIC;
+// ✅ Port config untuk Railway/Render
+const PORT = process.env.PORT || 4000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-
-//KONEKSI DATABASE
+// ✅ KONEKSI DATABASE dengan SSL untuk Aiven
 const db = mysql.createConnection({
     host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
+    port: process.env.DB_PORT || 3306,
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
-    database: process.env.DB_NAME
+    database: process.env.DB_NAME,
+    ssl: process.env.DB_SSL === 'true' ? {
+        rejectUnauthorized: false // ✅ Untuk Aiven SSL
+    } : false
 });
 
 // CEK KONEKSI DB
 db.connect(err => {
     if (err) {
-        console.error('Gagal konek ke MySQL:', err);
+        console.error('❌ Gagal konek ke database:', err);
         return;
     }
-    console.log('✅ Terhubung ke MySQL (XAMPP)');
+    console.log('✅ Terhubung ke database:', process.env.DB_HOST);
 });
 
-
-const verifyToken = require('./middleware/auth'); //menggunakan middleware
+const verifyToken = require('./middleware/auth');
 const JWT_SECRET = process.env.JWT_SECRET;
 
-
-
 // =====================
-// Test ROUTES
+// Test ROUTE
 // =====================
 app.get('/', (req, res) => {
-    res.send('Server Node.js + XAMPP aktif!');
+    res.json({ 
+        status: 'ok', 
+        message: 'FlowBeat API is running',
+        timestamp: new Date().toISOString()
+    });
 });
 
 // =====================
@@ -60,26 +65,33 @@ app.get('/', (req, res) => {
 // =====================
 app.post('/api/register', async (req, res) => {
     const { name, phone_number, password, address } = req.body;
-    const hashed = await bcrypt.hash(password, 10);
-    const defaultPhoto = 'default-avatar-profile.jpg';
-
-    const sql = `
-        INSERT INTO lansia (name, phone_number, password, address, photo)
-        VALUES (?, ?, ?, ?, ?)
-    `;
-    db.query(sql, [name, phone_number, hashed, address, defaultPhoto], (err, result) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Akun berhasil dibuat', id: result.insertId });
-    });
+    
+    try {
+        const hashed = await bcrypt.hash(password, 10);
+        const defaultPhoto = 'default-avatar-profile.jpg';
+        
+        const sql = `
+            INSERT INTO lansia (name, phone_number, password, address, photo)
+            VALUES (?, ?, ?, ?, ?)
+        `;
+        
+        db.query(sql, [name, phone_number, hashed, address, defaultPhoto], (err, result) => {
+            if (err) {
+                console.error('Error register:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ message: 'Akun berhasil dibuat', id: result.insertId });
+        });
+    } catch (error) {
+        console.error('Error hashing password:', error);
+        res.status(500).json({ error: 'Gagal membuat akun' });
+    }
 });
 
 // =====================
 // LOGIN
 // =====================
 app.post('/api/login', (req, res) => {
-    // console.log('Body login diterima:', req.body);
-
-    // Terima keduanya: phone atau phone_number
     const phone_number = req.body.phone_number || req.body.phone;
     const { password } = req.body;
 
@@ -88,15 +100,30 @@ app.post('/api/login', (req, res) => {
     }
 
     db.query('SELECT * FROM lansia WHERE phone_number = ?', [phone_number], async (err, results) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (results.length === 0) return res.status(401).json({ message: 'User tidak ditemukan' });
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: err.message });
+        }
+        
+        if (results.length === 0) {
+            return res.status(401).json({ message: 'User tidak ditemukan' });
+        }
 
         const user = results[0];
+        
         try {
             const match = await bcrypt.compare(password, user.password);
-            if (!match) return res.status(401).json({ message: 'Password salah' });
+            
+            if (!match) {
+                return res.status(401).json({ message: 'Password salah' });
+            }
 
-            const token = jwt.sign({ id: user.id, name: user.name }, JWT_SECRET, { expiresIn: '2h' });
+            const token = jwt.sign(
+                { id: user.id, name: user.name }, 
+                JWT_SECRET, 
+                { expiresIn: '7d' } // ✅ 7 hari untuk production
+            );
+            
             return res.json({
                 message: 'Login berhasil',
                 token,
@@ -175,9 +202,6 @@ app.get('/api/home', verifyToken, (req, res) => {
 });
 
 app.use('/images', express.static(path.join(__dirname, 'images')));
-
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
-
 
 // =====================
 // GET Akun
@@ -592,8 +616,7 @@ app.delete('/notifikasi/:id', (req, res) => {
     });
 });
 
-
 app.listen(PORT, HOST, () => {
-    console.log(`Server berjalan di http://localhost:${PORT}`);
-    console.log(`Akses jaringan: http://${IP_PUBLIC}:${PORT}`);
+    console.log(`✅ Server berjalan di http://localhost:${PORT}`);
+    console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
 });
